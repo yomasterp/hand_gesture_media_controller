@@ -1,79 +1,114 @@
+"""
+Hand-Gesture Media Controller (v2)
+──────────────────────────────────
+Gestures
+  • Thumb–index pinch      →  Play / Pause
+  • Right-swipe (open hand)→  Fast-forward 10 s
+  • Left-swipe  (open hand)→  Rewind       10 s
+  • Up-swipe    (open hand)→  Volume Up
+  • Down-swipe  (open hand)→  Volume Down
+
+Press **q** in the OpenCV window to quit.
+"""
+
 import cv2
 import mediapipe as mp
-import time
 import pyautogui
+import time
 import math
+from collections import deque
 
-# Initialize MediaPipe
+# ─── Tunables ────────────────────────────────────────────────────────────────
+PINCH_DIST      = 35      # px  – thumb/index distance for Play / Pause
+SWIPE_THRESH_X  = 120     # px  – horizontal swipe sensitivity (∆x)
+SWIPE_THRESH_Y  = 120     # px  – vertical   swipe sensitivity (∆y)
+HISTORY_FRAMES  = 5       #      – frames kept to evaluate a swipe
+ACTION_DELAY    = 0.60    # s   – debounce per action family
+
+# ─── MediaPipe setup ─────────────────────────────────────────────────────────
 mp_hands = mp.solutions.hands
-mp_draw = mp.solutions.drawing_utils
-hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
+mp_draw  = mp.solutions.drawing_utils
+hands    = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
 
-# Initialize webcam
+# ─── Webcam ──────────────────────────────────────────────────────────────────
 cap = cv2.VideoCapture(0)
 
-# Variables to track previous positions
-prev_x, prev_time = None, 0
-cooldown = 1.5  # seconds between actions
+# ─── Trackers ────────────────────────────────────────────────────────────────
+pos_hist            = deque(maxlen=HISTORY_FRAMES)
+last_playpause_time = 0
+last_seek_time      = 0
+last_volume_time    = 0
 
-def distance(x1, y1, x2, y2):
-    return math.hypot(x2 - x1, y2 - y1)
+
+def dist(p1, p2):
+    """Euclidean distance between two (x, y) points."""
+    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+
 
 while True:
-    success, img = cap.read()
-    img = cv2.flip(img, 1)  # Flip for natural mirror view
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    results = hands.process(img_rgb)
+    ok, frame = cap.read()
+    if not ok:
+        break
 
-    h, w, c = img.shape
-    current_time = time.time()
+    frame = cv2.flip(frame, 1)
+    rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    res   = hands.process(rgb)
 
-    if results.multi_hand_landmarks:
-        for handLms in results.multi_hand_landmarks:
-            lm_list = []
-            for id, lm in enumerate(handLms.landmark):
-                cx, cy = int(lm.x * w), int(lm.y * h)
-                lm_list.append((cx, cy))
+    h, w, _ = frame.shape
+    now = time.time()
 
-            if lm_list:
-                # Get key points
-                thumb_tip = lm_list[4]
-                index_tip = lm_list[8]
+    if res.multi_hand_landmarks:
+        for hand in res.multi_hand_landmarks:
+            # pixel-coordinates of landmarks
+            lms = [(int(lm.x * w), int(lm.y * h)) for lm in hand.landmark]
+            thumb_tip, index_tip = lms[4], lms[8]
+            wrist_x,   wrist_y   = lms[0]
 
-                # Measure distance between thumb and index finger
-                dist = distance(thumb_tip[0], thumb_tip[1], index_tip[0], index_tip[1])
+            # ── Play / Pause (thumb–index pinch) ────────────────────────────
+            if dist(thumb_tip, index_tip) < PINCH_DIST and (now - last_playpause_time) > ACTION_DELAY:
+                pyautogui.press('space')
+                print("Play / Pause")
+                last_playpause_time = now
+                pos_hist.clear()                 # reset swipe history
+                continue                          # ignore swipe for this frame
 
-                # If thumb and index finger are close together, trigger Play/Pause
-                if dist < 40:
-                    if current_time - prev_time > cooldown:
-                        pyautogui.press('space')  # Play/Pause
-                        print("Play/Pause")
-                        prev_time = current_time
+            # ── Build swipe history ────────────────────────────────────────
+            pos_hist.append((wrist_x, wrist_y))
 
-                # Detect horizontal hand movement
-                hand_center_x = lm_list[0][0]  # Wrist point as center
+            if len(pos_hist) == HISTORY_FRAMES:
+                dx = pos_hist[-1][0] - pos_hist[0][0]
+                dy = pos_hist[-1][1] - pos_hist[0][1]
 
-                if prev_x is not None:
-                    move_x = hand_center_x - prev_x
+                # ── Horizontal swipe → seek ──────────────────────────────
+                if abs(dx) > abs(dy) and abs(dx) > SWIPE_THRESH_X and (now - last_seek_time) > ACTION_DELAY:
+                    if dx > 0:
+                        pyautogui.press('right')     # fast-forward
+                        print("Fast-forward")
+                    else:
+                        pyautogui.press('left')      # rewind
+                        print("Rewind")
+                    last_seek_time = now
+                    pos_hist.clear()
+                    continue
 
-                    if move_x > 80:  # Swiped right
-                        if current_time - prev_time > cooldown:
-                            pyautogui.press('right')  # Fast-forward
-                            print("Fast Forward")
-                            prev_time = current_time
+                # ── Vertical swipe → volume ──────────────────────────────
+                if abs(dy) > abs(dx) and abs(dy) > SWIPE_THRESH_Y and (now - last_volume_time) > ACTION_DELAY:
+                    if dy < 0:
+                        pyautogui.press('up')        # volume up
+                        print("Volume Up")
+                    else:
+                        pyautogui.press('down')      # volume down
+                        print("Volume Down")
+                    last_volume_time = now
+                    pos_hist.clear()
+                    continue
 
-                    elif move_x < -80:  # Swiped left
-                        if current_time - prev_time > cooldown:
-                            pyautogui.press('left')  # Rewind
-                            print("Rewind")
-                            prev_time = current_time
+            # Draw landmarks for visual feedback
+            mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
+    else:
+        pos_hist.clear()
 
-                prev_x = hand_center_x
-
-            mp_draw.draw_landmarks(img, handLms, mp_hands.HAND_CONNECTIONS)
-
-    cv2.imshow("Hand Tracking Media Controller", img)
-
+    cv2.imshow("Hand-Gesture Media Controller", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
